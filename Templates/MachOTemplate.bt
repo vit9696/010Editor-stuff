@@ -219,7 +219,8 @@ typedef enum <uint> {
     MACH_BUNDLE       = 0x8,
     MACH_DYLIB_STUB   = 0x9,
     MACH_DSYM         = 0xA,
-    MACH_KEXT_BUNDLE  = 0xB
+    MACH_KEXT_BUNDLE  = 0xB,
+    MACH_FILESET      = 0xC,
 } FileType;
 
 typedef enum <uint> {
@@ -684,6 +685,11 @@ typedef enum <uint> {
     LINKER_OPTIMIZATION_HINT = 0x2E,
     VERSION_MIN_TVOS         = 0x2F,
     VERSION_MIN_WATCHOS      = 0x30,
+    NOTE                     = 0x31,
+    BUILD_VERSION            = 0x32,
+    DYLD_EXPORTS_TRIE        = 0x33 | REQ_DYLD,
+    DYLD_CHAINED_FIXUPS      = 0x34 | REQ_DYLD,
+    LC_FILESET_ENTRY         = 0x35 | REQ_DYLD,
 } LoadCommandType <read=LoadCommandTypeRead>;
 
 string LoadCommandTypeRead(LoadCommandType &loadCommandType) {
@@ -786,6 +792,16 @@ string LoadCommandTypeRead(LoadCommandType &loadCommandType) {
             return "VERSION_MIN_TVOS";
         case VERSION_MIN_WATCHOS :
             return "VERSION_MIN_WATCHOS";
+        case NOTE:
+            return "NOTE";
+        case BUILD_VERSION:
+            return "BUILD_VERSION";
+        case DYLD_EXPORTS_TRIE:
+            return "DYLD_EXPORTS_TRIE";
+        case DYLD_CHAINED_FIXUPS:
+            return "DYLD_CHAINED_FIXUPS";
+        case LC_FILESET_ENTRY:
+            return "LC_FILESET_ENTRY";
         default :
             return "Error";
     }
@@ -1591,6 +1607,34 @@ typedef struct {
         break;
     case LINKER_OPTIMIZATION_HINT :
         // TODO : Parse optimiations
+        break;
+    case NOTE:
+        char    data_owner[16]; /* owner name for this LC_NOTE */
+        uint64  offset;     /* file offset of this data */
+        uint64  size;       /* length of data region */
+        break;
+    case BUILD_VERSION:
+        uint32  platform;   /* platform */
+        uint32  minos;      /* X.Y.Z is encoded in nibbles xxxx.yy.zz */
+        uint32  sdk;        /* X.Y.Z is encoded in nibbles xxxx.yy.zz */
+        uint32  ntools;     /* number of tool entries following this */
+        break;
+    case DYLD_EXPORTS_TRIE:
+    case DYLD_CHAINED_FIXUPS:
+        uint32    dataoff;    /* file offset of data in __LINKEDIT segment */
+        uint32    datasize;   /* file size of data in __LINKEDIT segment  */
+        break;
+    case LC_FILESET_ENTRY:
+        uint64     vmaddr;     /* memory address of the entry */
+        uint64     fileoff;    /* file offset of the entry */
+        uint32     entry_id;   /* contained entry id */
+        uint32     reserved;   /* reserved */
+        if (entry_id < command_size) {
+            FSeek(FTell() - (sizeof(uint64) * 4));
+            // Then skip to the end of the command based on the command_size
+            FSkip(entry_id);
+            char       entry_name[command_size - entry_id];
+        }
         break;
     default :
         Warning("Hit an unknown or unsupported load command : [%d]", command);
