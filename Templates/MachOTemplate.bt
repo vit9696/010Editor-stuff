@@ -1655,6 +1655,154 @@ typedef struct(int size_of_list) {
     LoadCommand loadCommand[size_of_list];
 } LoadCommandList <optimize=false, read=LoadCommandListReader, comment="LoadCommand list">;
 
+// DYLD_CHAINED_PTR_64_KERNEL_CACHE, DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE
+typedef struct
+{
+    uint64      target     : 30,   // basePointers[cacheLevel] + target
+                cacheLevel :  2,   // what level of cache to bind to (indexes a mach_header array)
+                diversity  : 16,
+                addrDiv    :  1,
+                key        :  2,
+                next       : 12,    // 1 or 4-byte stide
+                isAuth     :  1;    // 0 -> not authenticated.  1 -> authenticated
+}  dyld_chained_ptr_64_kernel_cache_rebase <optimize=false>;
+
+typedef struct (uint32 data_offset, uint32 data_size, LoadCommandList &loadCommandList) {
+    FSeek(data_offset);
+
+    typedef struct {
+        uint32    fixups_version;    // 0
+        uint32    starts_offset;     // offset of dyld_chained_starts_in_image in chain_data
+        uint32    imports_offset;    // offset of imports table in chain_data
+        uint32    symbols_offset;    // offset of symbol strings in chain_data
+        uint32    imports_count;     // number of imported symbol names
+        uint32    imports_format;    // DYLD_CHAINED_IMPORT*
+        uint32    symbols_format;    // 0 => uncompressed, 1 => zlib compressed
+    } dyld_chained_fixups_header <optimize=false>;
+
+    dyld_chained_fixups_header fixupsHdr;
+
+    FSeek(data_offset + fixupsHdr.starts_offset);
+
+
+    enum {
+        DYLD_CHAINED_PTR_START_NONE   = 0xFFFF, // used in page_start[] to denote a page with no fixups
+        DYLD_CHAINED_PTR_START_MULTI  = 0x8000, // used in page_start[] to denote a page which has multiple starts
+        DYLD_CHAINED_PTR_START_LAST   = 0x8000, // used in chain_starts[] to denote last start in list for page
+    };
+    // values for dyld_chained_starts_in_segment.pointer_format
+    typedef enum <uint16> {
+        DYLD_CHAINED_PTR_ARM64E                 =  1,    // stride 8, unauth target is vmaddr
+        DYLD_CHAINED_PTR_64                     =  2,    // target is vmaddr
+        DYLD_CHAINED_PTR_32                     =  3,
+        DYLD_CHAINED_PTR_32_CACHE               =  4,
+        DYLD_CHAINED_PTR_32_FIRMWARE            =  5,
+        DYLD_CHAINED_PTR_64_OFFSET              =  6,    // target is vm offset
+        DYLD_CHAINED_PTR_ARM64E_OFFSET          =  7,    // old name
+        DYLD_CHAINED_PTR_ARM64E_KERNEL          =  7,    // stride 4, unauth target is vm offset
+        DYLD_CHAINED_PTR_64_KERNEL_CACHE        =  8,
+        DYLD_CHAINED_PTR_ARM64E_USERLAND        =  9,    // stride 8, unauth target is vm offset
+        DYLD_CHAINED_PTR_ARM64E_FIRMWARE        = 10,    // stride 4, unauth target is vmaddr
+        DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE    = 11,    // stride 1, x86_64 kernel caches
+    } DYLD_CHAINED_PTR_TYPE;
+
+    // This struct is embedded in dyld_chain_starts_in_image
+    // and passed down to the kernel for page-in linking
+    typedef struct (LoadCommandList &loadCommandList, uint32 base)
+    {
+        uint32    size;               // size of this (amount kernel needs to copy)
+        uint16    page_size;          // 0x1000 or 0x4000
+        DYLD_CHAINED_PTR_TYPE  pointer_format;     // DYLD_CHAINED_PTR_*
+        uint64    segment_offset;     // offset in memory to start of segment
+        uint32    max_valid_pointer;  // for 32-bit OS, any value beyond this is not a pointer
+        uint16    page_count;         // how many pages are in array
+        uint16    page_start[page_count];      // each entry is offset in each page of first element in chain
+                                        // or DYLD_CHAINED_PTR_START_NONE if no fixups on page
+
+        local uint32 i = 0;
+        local uint64 segment_file_offset = 0;
+        local int found = FALSE;
+
+        for (i = 0; i < loadCommandList.list_size; i++) {
+            switch(loadCommandList.loadCommand[i].command) {
+                case SEGMENT_64:
+                    // FIXME: hack for macOS kernel
+                    if (loadCommandList.loadCommand[i].vm_address - 0xFFFFFF8000200000 == segment_offset) {
+                        segment_file_offset = loadCommandList.loadCommand[i].file_offset;
+                        found = TRUE;
+                        break;
+                    }
+            }
+        }
+
+        if (!found) {
+            Printf("Failed to find segment for %Lx\n", segment_offset);
+            Assert(FALSE);
+        }
+
+        local uint64 fixup_off;
+        local uint64 fixup_next;
+
+        local uint64 old = 0;
+        i = 0;
+        while (i < page_count) {
+            if (page_start[i] != DYLD_CHAINED_PTR_START_NONE
+                && (page_start[i] & DYLD_CHAINED_PTR_START_MULTI) != 0) {
+                Printf("Unsupported page_start format\n");
+                Assert(FALSE);
+            }
+
+            if (page_start[i] != DYLD_CHAINED_PTR_START_NONE) {
+                if (pointer_format == DYLD_CHAINED_PTR_64_KERNEL_CACHE
+                    || pointer_format == DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE) {
+                    // Printf("Found at %Lx\n", segment_file_offset + i * page_size + page_start[i]);
+                    old = FTell();
+                    
+                    fixup_off = segment_file_offset + i * page_size + page_start[i];
+                    do { 
+                        FSeek(fixup_off);
+                        dyld_chained_ptr_64_kernel_cache_rebase rebase;
+                        Assert(rebase.isAuth == FALSE);
+                        Assert(rebase.key == 0);
+                        fixup_next = rebase.next * 1;
+                        fixup_off += fixup_next;
+                    } while (fixup_next != 0);
+
+                    FSeek(old);
+                }
+            }
+
+
+            ++i;
+        }
+     // uint16_t    chain_starts[1];    // some 32-bit formats may require multiple starts per page.
+                                        // for those, if high bit is set in page_starts[], then it
+                                        // is index into chain_starts[] which is a list of starts
+                                        // the last of which has the high bit set
+    } dyld_chained_starts_in_segment <optimize=false>;
+
+    typedef struct (uint32 data_offset, uint32 data_size) {
+        uint32    seg_count;
+        uint32 seg_info_offset[seg_count];
+        local uint32 i = 0;
+        local uint32 base = 0;
+        while (i < seg_count) {
+            /* each entry is offset into this struct for that segment 
+               followed by pool of dyld_chain_starts_in_segment data
+             */
+            if (seg_info_offset[i] != 0) {
+                base = data_offset + fixupsHdr.starts_offset + seg_info_offset[i];
+                FSeek(base);
+                dyld_chained_starts_in_segment starts_in_segment(loadCommandList, base);
+            }
+
+            ++i;
+        }
+    } dyld_chained_starts_in_image <optimize=false>;
+
+    dyld_chained_starts_in_image starts(data_offset, data_size);
+} DyldChainedFixups <optimize=false>;
+
 string LoadCommandListReader(LoadCommandList &loadCommandList) {
     local string s;
     s = SPrintf(s, "%d load commands", loadCommandList.list_size);
@@ -1693,6 +1841,14 @@ if(header.magic == MACHO_32 || header.magic == MACHO_64) {
                                             loadCommandList.loadCommand[i].number_of_symbol_table_entries,
                                             loadCommandList.loadCommand[i].string_table_offset,
                                             loadCommandList.loadCommand[i].string_table_size);
+                    FSeek(previous_position);
+                break;
+            case DYLD_CHAINED_FIXUPS:
+                    previous_position = FTell();
+                    DyldChainedFixups dyldFixups(
+                                            loadCommandList.loadCommand[i].dataoff,
+                                            loadCommandList.loadCommand[i].datasize,
+                                            loadCommandList);
                     FSeek(previous_position);
                 break;
             default:
